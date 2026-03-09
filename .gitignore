@@ -1,0 +1,11 @@
+# Ambiente
+.env
+
+# Logs
+*.log
+
+# Temporários
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db

@@ -1,0 +1,26 @@
+# Git
+.git
+.gitignore
+.github
+
+# Documentação
+*.md
+!README.md
+
+# Ambiente
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Temporários
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+
+# Scripts de deploy (não necessários no container)
+deploy.ps1
+deploy.sh

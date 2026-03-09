@@ -1,0 +1,21 @@
+services:
+  # ══════════════════════════════════════════════════════════════════════════
+  # DEPLOY — Executa apenas os artefatos SQL alterados na branch atual
+  # ══════════════════════════════════════════════════════════════════════════
+  deploy:
+    build:
+      context: .
+      dockerfile: Dockerfile.deploy
+    container_name: datatable-deploy
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=host.docker.internal
+      - DB_PORT=3306
+      - DB_USER=${MYSQL_USER}
+      - DB_PASSWORD=${MYSQL_PASSWORD}
+      - DB_NAME=${MYSQL_DATABASE}
+      - BASE_BRANCH=${BASE_BRANCH:-main}
+    volumes:
+      - .:/workspace
+    working_dir: /workspace

@@ -1,0 +1,5 @@
+FROM alpine:3.19
+
+RUN apk add --no-cache git mysql-client bash
+
+ENTRYPOINT ["bash", "-c", "sed -i 's/\\r$//' /workspace/scripts/deploy-local.sh && bash /workspace/scripts/deploy-local.sh"]
