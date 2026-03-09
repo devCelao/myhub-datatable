@@ -1,0 +1,267 @@
+name: "Deploy Database"
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag para deploy (ex: v1.2.0)"
+        required: true
+        type: string
+
+env:
+  EXECUTION_ORDER: "tables views procedures events"
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════
+  # JOB 1 - Validar tag e identificar artefatos alterados
+  # ════════════════════════════════════════════════════════════════════════
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      tag_exists: ${{ steps.check-tag.outputs.exists }}
+      previous_tag: ${{ steps.find-prev.outputs.tag }}
+      changed_files: ${{ steps.diff.outputs.files }}
+      has_changes: ${{ steps.diff.outputs.has_changes }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verificar se a tag existe
+        id: check-tag
+        run: |
+          if git rev-parse "refs/tags/${{ inputs.tag }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Tag '${{ inputs.tag }}' encontrada."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "❌ Tag '${{ inputs.tag }}' não existe no repositório."
+          fi
+
+      - name: Encontrar tag anterior
+        if: steps.check-tag.outputs.exists == 'true'
+        id: find-prev
+        run: |
+          TAGS=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$')
+          PREV=""
+          FOUND=false
+
+          while IFS= read -r t; do
+            if [ "$FOUND" = true ]; then
+              PREV="$t"
+              break
+            fi
+            if [ "$t" = "${{ inputs.tag }}" ]; then
+              FOUND=true
+            fi
+          done <<< "$TAGS"
+
+          if [ -z "$PREV" ]; then
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "📦 Primeira tag — todos os arquivos SQL serão incluídos."
+          else
+            echo "tag=$PREV" >> "$GITHUB_OUTPUT"
+            echo "📦 Tag anterior: $PREV"
+          fi
+
+      - name: Identificar arquivos .sql alterados
+        if: steps.check-tag.outputs.exists == 'true'
+        id: diff
+        run: |
+          PREV="${{ steps.find-prev.outputs.tag }}"
+          TAG="${{ inputs.tag }}"
+
+          if [ -z "$PREV" ]; then
+            FILES=$(git ls-tree -r --name-only "$TAG" -- src/ | grep '\.sql$' || true)
+          else
+            FILES=$(git diff --name-only "$PREV" "$TAG" -- src/ | grep '\.sql$' || true)
+          fi
+
+          if [ -z "$FILES" ]; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "files=" >> "$GITHUB_OUTPUT"
+            echo "⚠️ Nenhum arquivo .sql alterado entre $PREV e $TAG."
+          else
+            FILES_JSON=$(echo "$FILES" | jq -R -s -c 'split("\n") | map(select(. != ""))')
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "files=$FILES_JSON" >> "$GITHUB_OUTPUT"
+            echo "📄 Arquivos alterados:"
+            echo "$FILES"
+          fi
+
+  # ════════════════════════════════════════════════════════════════════════
+  # JOB 2 - Copiar artefatos para o servidor
+  # ════════════════════════════════════════════════════════════════════════
+  transfer:
+    runs-on: ubuntu-latest
+    needs: validate
+    if: needs.validate.outputs.tag_exists == 'true' && needs.validate.outputs.has_changes == 'true'
+    env:
+      DEPLOY_DIR: ${{ secrets.DEPLOY_PATH }}/Datatables
+    steps:
+      - name: Checkout na tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Preparar artefatos para envio
+        id: prepare
+        run: |
+          CHANGED='${{ needs.validate.outputs.changed_files }}'
+          STAGING="staging"
+          mkdir -p "$STAGING"
+
+          echo "$CHANGED" | jq -r '.[]' | while read -r file; do
+            if [ -f "$file" ]; then
+              DIR=$(dirname "$file" | sed 's|^src/||')
+              mkdir -p "$STAGING/$DIR"
+              cp "$file" "$STAGING/$DIR/"
+              echo "  ✅ $file"
+            else
+              echo "  ⚠️ $file não encontrado na tag (possível remoção)."
+            fi
+          done
+
+          echo "📦 Artefatos preparados em $STAGING/"
+          find "$STAGING" -name '*.sql' | sort
+
+      - name: Limpar diretório remoto
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            rm -rf ${{ env.DEPLOY_DIR }}
+            mkdir -p ${{ env.DEPLOY_DIR }}
+            echo "🧹 Diretório ${{ env.DEPLOY_DIR }} preparado."
+
+      - name: Copiar artefatos para o servidor
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "staging/*"
+          target: ${{ env.DEPLOY_DIR }}
+          strip_components: 1
+
+      - name: Copiar artefatos para dentro do container MySQL
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            docker exec mysql rm -rf ${{ env.DEPLOY_DIR }}
+            docker exec mysql mkdir -p ${{ env.DEPLOY_DIR }}
+            docker cp ${{ env.DEPLOY_DIR }}/. mysql:${{ env.DEPLOY_DIR }}/
+
+            echo "📂 Artefatos no container:"
+            docker exec mysql find ${{ env.DEPLOY_DIR }} -name '*.sql' | sort
+            COUNT=$(docker exec mysql find ${{ env.DEPLOY_DIR }} -name '*.sql' | wc -l)
+            echo "📊 Total: $COUNT arquivo(s) SQL."
+
+  # ════════════════════════════════════════════════════════════════════════
+  # JOB 3 - Executar artefatos SQL no banco de dados
+  # ════════════════════════════════════════════════════════════════════════
+  execute:
+    runs-on: ubuntu-latest
+    needs: [validate, transfer]
+    if: needs.validate.outputs.tag_exists == 'true' && needs.validate.outputs.has_changes == 'true'
+    env:
+      DEPLOY_DIR: ${{ secrets.DEPLOY_PATH }}/Datatables
+    steps:
+      - name: Executar scripts SQL em ordem
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -euo pipefail
+
+            CONTAINER="mysql"
+            DEPLOY_DIR="${{ env.DEPLOY_DIR }}"
+            DB_USER="${{ secrets.MYSQL_USER }}"
+            DB_PASS="${{ secrets.MYSQL_PASSWORD }}"
+            DB_NAME="${{ secrets.MYSQL_DATABASE }}"
+
+            EXECUTION_ORDER="${{ env.EXECUTION_ORDER }}"
+
+            TOTAL=0
+            SUCCESS=0
+            FAILED=0
+            ERRORS=""
+
+            echo "══════════════════════════════════════════════════════"
+            echo "  🚀 Deploy Database — ${{ inputs.tag }}"
+            echo "══════════════════════════════════════════════════════"
+
+            for FOLDER in $EXECUTION_ORDER; do
+              DIR="$DEPLOY_DIR/$FOLDER"
+              docker exec $CONTAINER test -d "$DIR" || continue
+
+              echo ""
+              echo "┌──────────────────────────────────────────────────"
+              echo "│ 📁 Executando: $FOLDER"
+              echo "└──────────────────────────────────────────────────"
+
+              for SQL_FILE in $(docker exec $CONTAINER find "$DIR" -name '*.sql' | sort); do
+                FILENAME=$(basename "$SQL_FILE")
+                TOTAL=$((TOTAL + 1))
+
+                echo -n "  ▶ $FILENAME ... "
+
+                OUTPUT=$(docker exec $CONTAINER mysql \
+                  --user="$DB_USER" \
+                  --password="$DB_PASS" \
+                  --database="$DB_NAME" \
+                  --default-character-set=utf8mb4 \
+                  --batch \
+                  -e "source $SQL_FILE" 2>&1) && STATUS=$? || STATUS=$?
+
+                if [ $STATUS -eq 0 ]; then
+                  echo "✅"
+                  SUCCESS=$((SUCCESS + 1))
+                else
+                  echo "❌ (exit code: $STATUS)"
+                  echo "    Erro: $OUTPUT"
+                  FAILED=$((FAILED + 1))
+                  ERRORS="${ERRORS}\n  ❌ ${FOLDER}/${FILENAME}: ${OUTPUT}"
+                fi
+              done
+            done
+
+            echo ""
+            echo "══════════════════════════════════════════════════════"
+            echo "  📊 Resultado do Deploy"
+            echo "══════════════════════════════════════════════════════"
+            echo "  Total:     $TOTAL"
+            echo "  Sucesso:   $SUCCESS"
+            echo "  Falhas:    $FAILED"
+            echo "══════════════════════════════════════════════════════"
+
+            if [ $FAILED -gt 0 ]; then
+              echo ""
+              echo "⚠️  Erros encontrados:"
+              echo -e "$ERRORS"
+              echo ""
+              exit 1
+            fi
+
+            echo ""
+            echo "✅ Deploy concluído com sucesso!"
+
+      - name: Limpar artefatos do servidor
+        if: always()
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            docker exec mysql rm -rf ${{ env.DEPLOY_DIR }} 2>/dev/null || true
+            rm -rf ${{ env.DEPLOY_DIR }}
+            echo "🧹 Artefatos removidos do servidor e do container."
