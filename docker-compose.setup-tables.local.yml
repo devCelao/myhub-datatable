@@ -1,0 +1,95 @@
+networks:
+  databases:
+    external: true
+    name: databases
+
+services:
+  # ══════════════════════════════════════════════════════════════════════════
+  # SETUP TABLES - Execução de scripts SQL (one-shot)
+  # Espera que o MySQL já esteja rodando na rede 'databases'
+  # ══════════════════════════════════════════════════════════════════════════
+  mysql-setup-tables:
+    image: mysql:8.0
+    container_name: mysql-setup-tables
+    env_file:
+      - ../.env
+    environment:
+      - DB_HOST=mysql
+      - DB_PORT=3306
+      - DB_USER=${MYSQL_USER}
+      - DB_PASSWORD=${MYSQL_PASSWORD}
+      - DB_NAME=${MYSQL_DATABASE}
+    volumes:
+      - ${SQL_SCRIPTS_PATH}:/sql-scripts:ro
+    networks:
+      - databases
+    command: >
+      bash -c '
+        set -e
+
+        echo "=============================================="
+        echo "  SETUP TABLES - Execução de Scripts SQL"
+        echo "=============================================="
+        echo ""
+        echo "  Data: $$(date)"
+        echo "  Host: $$DB_HOST"
+        echo "  Database: $$DB_NAME"
+        echo ""
+
+        echo "Aguardando MySQL estar acessível..."
+        until mysql -h"$$DB_HOST" -P"$$DB_PORT" -u"$$DB_USER" -p"$$DB_PASSWORD" -e "SELECT 1" &> /dev/null; do
+          echo "  Aguardando..."
+          sleep 2
+        done
+        echo "MySQL acessível!"
+        echo ""
+
+        SCRIPT_COUNT=$$(ls -1 /sql-scripts/*.sql 2>/dev/null | wc -l)
+
+        if [ "$$SCRIPT_COUNT" -eq 0 ]; then
+          echo "Nenhum script SQL encontrado em /sql-scripts/"
+          exit 1
+        fi
+
+        echo "  Total de scripts: $$SCRIPT_COUNT"
+        echo ""
+        echo "----------------------------------------------"
+        echo "  Executando scripts SQL..."
+        echo "----------------------------------------------"
+        echo ""
+
+        SUCCESS_COUNT=0
+        FAIL_COUNT=0
+
+        for sql_file in $$(ls -1v /sql-scripts/*.sql); do
+          FILENAME=$$(basename "$$sql_file")
+          echo "  -> Executando: $$FILENAME"
+
+          if mysql -h"$$DB_HOST" -P"$$DB_PORT" -u"$$DB_USER" -p"$$DB_PASSWORD" \
+            --default-character-set=utf8mb4 "$$DB_NAME" < "$$sql_file" 2>&1; then
+            echo "     OK: $$FILENAME"
+            SUCCESS_COUNT=$$((SUCCESS_COUNT + 1))
+          else
+            echo "     FALHA: $$FILENAME"
+            FAIL_COUNT=$$((FAIL_COUNT + 1))
+          fi
+
+          echo ""
+        done
+
+        echo "----------------------------------------------"
+        echo "  Resumo:"
+        echo "    Sucessos: $$SUCCESS_COUNT"
+        echo "    Falhas:   $$FAIL_COUNT"
+        echo "    Total:    $$SCRIPT_COUNT"
+        echo "----------------------------------------------"
+
+        if [ "$$FAIL_COUNT" -gt 0 ]; then
+          echo ""
+          echo "  Execução concluída com falhas!"
+          exit 1
+        fi
+
+        echo ""
+        echo "  Setup de tabelas concluído com sucesso!"
+      '
